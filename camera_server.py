@@ -6,6 +6,8 @@ converts to JPEG, and serves as MJPEG at :8080/stream.
 """
 
 import json
+import signal
+import socket
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -122,15 +124,19 @@ def main():
     t.start()
 
     server = HTTPServer((HOST, PORT), Handler)
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    def shutdown(sig, frame):
+        server.shutdown()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
     print(f"MJPEG server listening on {HOST}:{PORT}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        node.destroy_node()
-        rclpy.shutdown()
+    server.serve_forever()
+    server.server_close()
+    node.destroy_node()
+    rclpy.shutdown()
 
 
 if __name__ == "__main__":

@@ -9,8 +9,10 @@ StartLimitBurst=5
 Type=simple
 User=booster
 Environment="PYTHONUNBUFFERED=1"
+Environment="FASTRTPS_DEFAULT_PROFILES_FILE=/opt/booster/BoosterRos2/fastdds_profile.xml"
 ExecStartPre=/bin/sleep 5
 ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec python3 /home/booster/camera_server/camera_server.py'
+TimeoutStopSec=5
 Restart=always
 RestartSec=3
 
