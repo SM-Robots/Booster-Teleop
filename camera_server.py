@@ -20,6 +20,7 @@ import struct
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 
 import cv2
 import numpy as np
@@ -38,10 +39,10 @@ _latest_jpeg = None
 _frame_count = 0
 _last_frame_time = 0.0
 
-# SDK state: 10 floats (rpy*3 + gyro*3 + acc*3 + timestamp) + odom 3 floats
-# = 13 doubles = 104 bytes, plus 1 byte for mode
-STATE_FMT = "=13db"  # 13 doubles + 1 byte
+# SDK state: 13 doubles (rpy*3 + gyro*3 + acc*3 + odom*3 + timestamp) + 1 int (mode)
+STATE_FMT = "=13di"
 STATE_SIZE = struct.calcsize(STATE_FMT)
+MODE_NAMES_GLOBAL = {0: "damping", 1: "prepare", 2: "walking", 3: "custom", 4: "soccer"}
 
 _state_shm = None  # shared memory
 _cmd_queue = None
@@ -55,17 +56,19 @@ def nv12_to_jpeg(data, width, height):
     return buf.tobytes()
 
 
-def pack_state(rpy, gyro, acc, odom_x, odom_y, odom_theta, ts, mode_byte):
+def pack_state(rpy, gyro, acc, odom_x, odom_y, odom_theta, ts, mode_int):
     return struct.pack(STATE_FMT,
                        rpy[0], rpy[1], rpy[2],
                        gyro[0], gyro[1], gyro[2],
                        acc[0], acc[1], acc[2],
-                       odom_x, odom_y, odom_theta, ts, mode_byte)
+                       odom_x, odom_y, odom_theta, ts, mode_int)
 
 
 def unpack_state(buf):
     vals = struct.unpack(STATE_FMT, buf)
+    mode_int = vals[13]
     return {
+        "mode": MODE_NAMES_GLOBAL.get(mode_int, f"unknown({mode_int})"),
         "imu": {
             "rpy": [round(vals[0], 4), round(vals[1], 4), round(vals[2], 4)],
             "gyro": [round(vals[3], 4), round(vals[4], 4), round(vals[5], 4)],
@@ -76,7 +79,6 @@ def unpack_state(buf):
             "theta": round(vals[11], 4),
         },
         "timestamp": vals[12],
-        "mode_byte": vals[13],
     }
 
 
@@ -101,6 +103,28 @@ def _sdk_worker(cmd_q, resp_q, shm_name):
     ChannelFactory.Instance().Init(0)
     client = B1LocoClient()
     client.Init()
+    mode_val = [0]  # cached mode
+
+    def poll_mode():
+        """Poll mode every second and update shared memory."""
+        while True:
+            try:
+                gm = GetModeResponse()
+                client.GetMode(gm)
+                # Map RobotMode enum to int
+                m = str(gm.mode)
+                if "Damping" in m or "kDamping" in m: mode_val[0] = 0
+                elif "Prepare" in m or "kPrepare" in m: mode_val[0] = 1
+                elif "Walking" in m or "kWalking" in m: mode_val[0] = 2
+                elif "Custom" in m or "kCustom" in m: mode_val[0] = 3
+                elif "Soccer" in m or "kSoccer" in m: mode_val[0] = 4
+                else: mode_val[0] = -1
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    import threading as _t
+    _t.Thread(target=poll_mode, daemon=True).start()
 
     def on_low_state(msg):
         imu = msg.imu_state
@@ -110,7 +134,7 @@ def _sdk_worker(cmd_q, resp_q, shm_name):
         ts[0] = time.time()
         shm.buf[:STATE_SIZE] = pack_state(
             imu.rpy, imu.gyro, imu.acc,
-            odom_data[0], odom_data[1], odom_data[2], ts[0], 0)
+            odom_data[0], odom_data[1], odom_data[2], ts[0], mode_val[0])
 
     def on_odometer(msg):
         odom_data[:] = [msg.x, msg.y, msg.theta]
@@ -239,16 +263,8 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _get_state(self):
-        # Read IMU/odom from shared memory
+        # Pure shared memory read — no queue, no blocking
         state = unpack_state(bytes(_state_shm.buf[:STATE_SIZE]))
-        # Get mode from SDK process
-        _cmd_queue.put({"command": "get_mode"})
-        try:
-            resp = _resp_queue.get(timeout=2.0)
-            state["mode"] = resp.get("mode", "unknown")
-        except Exception:
-            state["mode"] = "unknown"
-        del state["mode_byte"]
         self._json(200, state)
 
     def _post_command(self):
@@ -306,8 +322,11 @@ def main():
     node = CameraNode()
     threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
 
-    # HTTP server
-    server = HTTPServer((HOST, PORT), Handler)
+    # Threaded HTTP server — stream clients don't block commands
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+    server = ThreadedHTTPServer((HOST, PORT), Handler)
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     def shutdown(sig, _):
