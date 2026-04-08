@@ -46,7 +46,6 @@ MODE_NAMES_GLOBAL = {0: "damping", 1: "prepare", 2: "walking", 3: "custom", 4: "
 
 _state_shm = None  # shared memory
 _cmd_queue = None
-_resp_queue = None
 
 
 def nv12_to_jpeg(data, width, height):
@@ -83,7 +82,7 @@ def unpack_state(buf):
 
 
 # --- SDK child process -------------------------------------------------------
-def _sdk_worker(cmd_q, resp_q, shm_name):
+def _sdk_worker(cmd_q, shm_name):
     """Separate process: owns SDK DDS."""
     from booster_robotics_sdk_python import (
         ChannelFactory, B1LocoClient, B1LowStateSubscriber,
@@ -168,19 +167,10 @@ def _sdk_worker(cmd_q, resp_q, shm_name):
                 res = client.LieDown()
             elif cmd == "stop":
                 res = client.Move(0, 0, 0)
-            elif cmd == "get_mode":
-                gm = GetModeResponse()
-                res = client.GetMode(gm)
-                resp_q.put({"command": cmd, "result": res,
-                            "mode": MODE_NAMES.get(gm.mode, str(gm.mode))})
-                continue
             else:
-                resp_q.put({"error": f"unknown command: {cmd}"})
-                continue
-        except Exception as e:
-            resp_q.put({"error": str(e)})
-            continue
-        resp_q.put({"command": cmd, "result": res})
+                pass  # unknown command, ignore
+        except Exception:
+            pass  # fire-and-forget, don't block on errors
 
 
 # --- ROS2 node (camera only) -------------------------------------------------
@@ -274,13 +264,13 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             self._json(400, {"error": "invalid json"})
             return
+        cmd = data.get("command")
+        if not cmd:
+            self._json(400, {"error": "missing command"})
+            return
+        # Fire-and-forget: queue command and return immediately
         _cmd_queue.put(data)
-        try:
-            resp = _resp_queue.get(timeout=3.0)
-        except Exception:
-            resp = {"error": "timeout"}
-        code = 200 if "error" not in resp else 400
-        self._json(code, resp)
+        self._json(200, {"command": cmd, "queued": True})
 
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
@@ -300,7 +290,7 @@ class Handler(BaseHTTPRequestHandler):
 
 # --- Main --------------------------------------------------------------------
 def main():
-    global _cmd_queue, _resp_queue, _state_shm
+    global _cmd_queue, _state_shm
 
     # Shared memory for state (no Manager process needed)
     _state_shm = multiprocessing.shared_memory.SharedMemory(
@@ -308,12 +298,11 @@ def main():
     _state_shm.buf[:STATE_SIZE] = b'\x00' * STATE_SIZE
 
     _cmd_queue = multiprocessing.Queue()
-    _resp_queue = multiprocessing.Queue()
 
     # SDK in child process
     sdk_proc = multiprocessing.Process(
         target=_sdk_worker,
-        args=(_cmd_queue, _resp_queue, _state_shm.name),
+        args=(_cmd_queue, _state_shm.name),
         daemon=True)
     sdk_proc.start()
 
